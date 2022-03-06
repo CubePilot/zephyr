@@ -20,6 +20,13 @@ properties:
         only TX pin is used afterwards and should be configured.
         RX/TX conflicts must be handled on user side.
 
+    swap-tx-rx:
+      type: boolean
+      required: false
+      description: |
+        Swap TX and RX pins.
+        This is useful when using a UART lines are incorrectly wired.
+
     pinctrl-0:
       required: true
 

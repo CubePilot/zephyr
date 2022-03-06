@@ -1601,6 +1601,12 @@ static int uart_stm32_init(const struct device *dev)
 				 ll_parity,
 				 LL_USART_STOPBITS_1);
 
+#ifdef LL_USART_TXRX_SWAPPED // check if the TX and RX pins swap supported
+	if (config->swap_tx_rx) {
+		LL_USART_SetTXRXSwap(UartInstance, LL_USART_TXRX_SWAPPED);
+	}
+#endif
+
 	if (config->hw_flow_control) {
 		uart_stm32_set_hwctrl(dev, LL_USART_HWCONTROL_RTS_CTS);
 	}
@@ -1730,6 +1736,7 @@ static const struct uart_stm32_config uart_stm32_cfg_##index = {	\
 	.parity = DT_INST_ENUM_IDX_OR(index, parity, UART_CFG_PARITY_NONE),	\
 	.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(index),			\
 	.single_wire = DT_INST_PROP_OR(index, single_wire, false), \
+	.swap_tx_rx = DT_INST_PROP_OR(index, swap_tx_rx, false),	\
 	STM32_UART_POLL_IRQ_HANDLER_FUNC(index)				\
 };									\
 									\

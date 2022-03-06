@@ -25,6 +25,7 @@ struct uart_stm32_config {
 	int  parity;
 	/* switch to enable single wire / half duplex feature */
 	bool single_wire;
+	bool swap_tx_rx;
 	const struct pinctrl_dev_config *pcfg;
 #if defined(CONFIG_PM) \
 	&& !defined(CONFIG_UART_INTERRUPT_DRIVEN) \
