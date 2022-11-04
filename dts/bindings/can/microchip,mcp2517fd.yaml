@@ -1,0 +1,34 @@
+# Copyright (c) 2019 Karsten Koenig
+# SPDX-License-Identifier: Apache-2.0
+
+description: MCP2515 SPI CAN controller
+
+compatible: "microchip,mcp2517fd"
+
+include: [spi-device.yaml, can-controller.yaml]
+
+properties:
+    osc-freq:
+      type: int
+      required: true
+      description: Frequency of the external oscillator
+    int-gpios:
+      type: phandle-array
+      required: true
+      description: |
+        Interrupt pin.
+
+        This pin signals active low when produced by the controller. The
+        property value should ensure the flags properly describe the signal
+        that is presented to the driver.
+    pll-enable:
+      type: boolean
+      required: false
+      description: |
+        Enable the PLL.
+
+        If the PLL is enabled, the oscillator frequency is multiplied by 10.
+        Only works if the oscillator frequency is <= 4 MHz.
+    reg:
+      type: array
+      required: true
