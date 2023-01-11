@@ -12,6 +12,7 @@
 #include <drivers/spi.h>
 #include <drivers/gpio.h>
 #include <logging/log.h>
+#include <logging/log_ctrl.h>
 #include <sys/byteorder.h>
 
 LOG_MODULE_REGISTER(can_mcp2517fd, 3);
@@ -89,19 +90,33 @@ static uint16_t mcp2517_calculate_crc16(uint8_t* data, uint16_t size, uint16_t* 
     return crc;
 }
 
-static int mcp2517_cmd_soft_reset(const struct device *dev)
+// SPI Access Functions
+static int mcp2517_cmd_read_words_slow(const struct device *dev, uint16_t addr,
+				uint32_t *words, uint8_t num_words)
 {
 	const struct mcp251xfd_config *dev_cfg = dev->config;
-	uint16_t cmd = MCP251XFD_SPI_INSTRUCTION_RESET;
+	struct spi_config spi_cfg = dev_cfg->bus.config;
+	spi_cfg.frequency = 1000000U;
 
-	const struct spi_buf tx_buf = {
-		.buf = &cmd, .len = sizeof(cmd),
+	uint8_t cmd_buf[] = { (MCP251XFD_SPI_INSTRUCTION_READ << 4) | (addr >> 8),
+						  addr & 0xFF};
+
+	struct spi_buf tx_buf[] = {
+		{ .buf = cmd_buf, .len = sizeof(cmd_buf) },
+		{ .buf = NULL, .len = num_words*sizeof(uint32_t) }
 	};
 	const struct spi_buf_set tx = {
-		.buffers = &tx_buf, .count = 1U
+		.buffers = tx_buf, .count = ARRAY_SIZE(tx_buf)
+	};
+	struct spi_buf rx_buf[] = {
+		{ .buf = NULL, .len = sizeof(cmd_buf) },
+		{ .buf = words, .len = num_words*sizeof(uint32_t) }
+	};
+	const struct spi_buf_set rx = {
+		.buffers = rx_buf, .count = ARRAY_SIZE(rx_buf)
 	};
 
-    return spi_write_dt(&dev_cfg->bus, &tx);
+	return spi_transceive(dev_cfg->bus.bus, &spi_cfg, &tx, &rx);
 }
 
 // SPI Access Functions
@@ -129,6 +144,26 @@ static int mcp2517_cmd_read_words(const struct device *dev, uint16_t addr,
 	};
 
 	return spi_transceive_dt(&dev_cfg->bus, &tx, &rx);
+}
+
+static int mcp2517_cmd_write_words_slow(const struct device *dev, uint16_t addr,
+				 uint32_t *words, uint8_t num_words)
+{
+	const struct mcp251xfd_config *dev_cfg = dev->config;
+	struct spi_config spi_cfg = dev_cfg->bus.config;
+	spi_cfg.frequency = 1000000U;
+
+	uint8_t cmd_buf[] = { (MCP251XFD_SPI_INSTRUCTION_WRITE << 4) | (addr >> 8),
+						  addr & 0xFF};
+	struct spi_buf tx_buf[] = {
+		{ .buf = cmd_buf, .len = sizeof(cmd_buf) },
+		{ .buf = words, .len = num_words*sizeof(uint32_t) }
+	};
+	const struct spi_buf_set tx = {
+		.buffers = tx_buf, .count = ARRAY_SIZE(tx_buf)
+	};
+
+	return spi_write(dev_cfg->bus.bus, &spi_cfg, &tx);
 }
 
 static int mcp2517_cmd_write_words(const struct device *dev, uint16_t addr,
@@ -228,8 +263,50 @@ static int mcp2517_get_mode_int(const struct device *dev, uint8_t *mode)
 		return ret;
 	}
 	*mode = (con & MCP251XFD_CON_OPMOD_MASK) >> 21;
-	LOG_INF("Control: 0x%08x mode: %d", con, *mode);
+	// LOG_INF("Control: 0x%08x mode: %d", con, *mode);
 	return 0;
+}
+
+static int mcp2517_cmd_soft_reset(const struct device *dev)
+{
+	const struct mcp251xfd_config *dev_cfg = dev->config;
+	uint16_t cmd = MCP251XFD_SPI_INSTRUCTION_RESET;
+
+	const struct spi_buf tx_buf = {
+		.buf = &cmd, .len = sizeof(cmd),
+	};
+	const struct spi_buf_set tx = {
+		.buffers = &tx_buf, .count = 1U
+	};
+	const struct spi_config spi_cfg = {
+		.cs = dev_cfg->bus.config.cs,
+		.frequency = 1000000,
+		.operation = dev_cfg->bus.config.operation,
+		.slave = dev_cfg->bus.config.slave,
+	};
+    int ret = spi_write(dev_cfg->bus.bus, &spi_cfg, &tx);
+	if (ret < 0) {
+		LOG_ERR("Soft Reset failed: %d", ret);
+		return ret;
+	}
+	uint8_t retries = MCP2517FD_NUM_SPI_RETRIES;
+	uint8_t mode;
+	while (retries--) {
+		uint32_t con;
+		int ret = mcp2517_cmd_read_words_slow(dev, MCP251XFD_ADDR_CON, &con, 1);
+		if (ret < 0) {
+			return ret;
+		}
+		mode = (con & MCP251XFD_CON_OPMOD_MASK) >> 21;
+		if (ret < 0) {
+			LOG_ERR("Failed to read mode");
+			return ret;
+		}
+		if (mode == MCP251XFD_CON_MODE_CONFIG) {
+			return 0;
+		}
+		k_msleep(3);
+	}
 }
 
 static int mcp2517_set_mode_int(const struct device *dev, uint8_t mode)
@@ -336,7 +413,7 @@ static int mcp2517_read_rx_fifo(const struct device *dev,
 	}
 	if (!(fifo_status & MCP251XFD_FIFOSTA_TFNRFNIF)) {
 		// rx fifo empty
-		return 0;
+		return -ENODATA;
 	}
 	// get rx fifo address
 	uint32_t rx_fifo_addr;
@@ -380,9 +457,16 @@ static int32_t mcp2517_write_tx_fifo(const struct device *dev,
 		LOG_ERR("Failed to get FIFO status");
 		return ret;
 	}
+	// get mode
+	uint8_t mode;
+	mcp2517_get_mode_int(dev, &mode);
+	// change back to normal mode
+	const struct mcp251xfd_data* dev_data = dev->data;
+	if (mode != dev_data->mcp2517_mode) {
+		LOG_ERR("Bad State: mode=%d", mode);
+		mcp2517_set_mode_int(dev, dev_data->mcp2517_mode);
+	}
 	if (!(fifo_status & MCP251XFD_FIFOSTA_TFNRFNIF)) {
-		// tx fifo full
-		LOG_ERR("TX FIFO full");
 		return -EBUSY;
 	}
 	// LOG_INF("FIFO status: 0x%08x", fifo_status);
@@ -503,6 +587,7 @@ static int mcp2517_setup_tx_fifo(const struct device *dev)
 		LOG_ERR("Failed to read CON");
 		return ret;
 	}
+	con |= MCP251XFD_CON_SERR2LOM;
 	if (con & MCP251XFD_CON_TXQEN) {
 		con &= ~MCP251XFD_CON_TXQEN;
 		ret = mcp2517_cmd_write_words(dev, MCP251XFD_ADDR_CON, &con, 1);
@@ -523,6 +608,7 @@ static int mcp2517_setup_tx_fifo(const struct device *dev)
 		LOG_ERR("Invalid payload size");
 		return plsize;
 	}
+	LOG_INF("Setting payload size to %d", plsize);
 	tx_fifo_ctrl = (tx_fifo_ctrl & ~MCP251XFD_FIFOCON_PLSIZE_MASK) | plsize << 29;
 	tx_fifo_ctrl |= MCP251XFD_FIFOCON_TXEN;
 	// set fifo size
@@ -533,23 +619,23 @@ static int mcp2517_setup_tx_fifo(const struct device *dev)
 		LOG_ERR("Failed to write FIFO control");
 		return ret;
 	}
-	// setup tx event fifo
-	uint32_t tx_event_fifo_ctrl;
-	ret = mcp2517_cmd_read_words(dev, MCP251XFD_ADDR_TEFCON, &tx_event_fifo_ctrl, 1);
-	if (ret != 0) {
-		LOG_ERR("Failed to read TX event fifo");
-		return ret;
-	}
-	tx_event_fifo_ctrl = (tx_event_fifo_ctrl & ~(MCP251XFD_TEFCON_FSIZE_MASK)) | MCP2517FD_TXEVENT_FIFO_SIZE << 24;
+	// // setup tx event fifo
+	// uint32_t tx_event_fifo_ctrl;
+	// ret = mcp2517_cmd_read_words(dev, MCP251XFD_ADDR_TEFCON, &tx_event_fifo_ctrl, 1);
+	// if (ret != 0) {
+	// 	LOG_ERR("Failed to read TX event fifo");
+	// 	return ret;
+	// }
+	// tx_event_fifo_ctrl = (tx_event_fifo_ctrl & ~(MCP251XFD_TEFCON_FSIZE_MASK)) | MCP2517FD_TXEVENT_FIFO_SIZE << 24;
 
-	tx_event_fifo_ctrl = tx_event_fifo_ctrl | MCP251XFD_TEFCON_TEFNEIE;
+	// tx_event_fifo_ctrl = tx_event_fifo_ctrl | MCP251XFD_TEFCON_TEFNEIE;
 
 	// write register
-	ret = mcp2517_cmd_write_words(dev, MCP251XFD_ADDR_TEFCON, &tx_event_fifo_ctrl, 1);
-	if (ret != 0) {
-		LOG_ERR("Failed to setup TX event fifo");
-		return ret;
-	}
+	// ret = mcp2517_cmd_write_words(dev, MCP251XFD_ADDR_TEFCON, &tx_event_fifo_ctrl, 1);
+	// if (ret != 0) {
+	// 	LOG_ERR("Failed to setup TX event fifo");
+	// 	return ret;
+	// }
 
 	return ret;
 }
@@ -677,9 +763,10 @@ static int mcp2517_send(const struct device *dev,
 
 static int mcp2517_get_core_clock(const struct device *dev, uint32_t *rate)
 {
-	const struct mcp251xfd_config *dev_cfg = dev->config;
+	const struct mcp251xfd_data *dev_data = dev->data;
 
-	*rate = dev_cfg->osc_freq;
+	*rate = dev_data->osc_freq;
+	LOG_INF("osc_freq: %d", *rate);
 	return 0;
 }
 
@@ -724,7 +811,7 @@ static int mcp2517_wait_for_osc(const struct device *dev, bool pll_enable)
 {
 	uint32_t osc;
 	int ret = 0;
-	ret = mcp2517_cmd_read_words(dev, MCP251XFD_ADDR_OSC, &osc, 1);
+	ret = mcp2517_cmd_read_words_slow(dev, MCP251XFD_ADDR_OSC, &osc, 1);
 	if (ret < 0) {
 		LOG_ERR("Failed to read osc");
 		return ret;
@@ -734,14 +821,15 @@ static int mcp2517_wait_for_osc(const struct device *dev, bool pll_enable)
 	} else {
 		osc &= ~MCP251XFD_OSC_PLLEN;
 	}
-	ret = mcp2517_cmd_write_words(dev, MCP251XFD_ADDR_OSC, &osc, 1);
+	ret = mcp2517_cmd_write_words_slow(dev, MCP251XFD_ADDR_OSC, &osc, 1);
 	if (ret < 0) {
 		LOG_ERR("Failed to write osc");
 		return ret;
 	}
+	LOG_INF("osc: 0x%08x", osc);
 	uint8_t retries = MCP2517FD_NUM_SPI_RETRIES;
 	while (retries--) {
-		ret = mcp2517_cmd_read_words(dev, MCP251XFD_ADDR_OSC, &osc, 1);
+		ret = mcp2517_cmd_read_words_slow(dev, MCP251XFD_ADDR_OSC, &osc, 1);
 		if (ret < 0) {
 			LOG_ERR("Failed to read osc");
 			return ret;
@@ -751,6 +839,7 @@ static int mcp2517_wait_for_osc(const struct device *dev, bool pll_enable)
 		}
 		k_msleep(3);
 	}
+	LOG_ERR("Bad OSC State 0x%08x", osc);
 	return -EIO;
 }
 
@@ -758,18 +847,17 @@ static int mcp2517_set_mode(const struct device *dev, enum can_mode mode)
 {
 	const struct mcp251xfd_config *dev_cfg = dev->config;
 	struct mcp251xfd_data *dev_data = dev->data;
-	uint8_t mcp2517_mode;
 	int ret;
 
 	switch (mode) {
 	case CAN_NORMAL_MODE:
-		mcp2517_mode = MCP251XFD_CON_MODE_CAN2_0;
+		dev_data->mcp2517_mode = MCP251XFD_CON_MODE_CAN2_0;
 		break;
 	case CAN_SILENT_MODE:
-		mcp2517_mode = MCP251XFD_CON_MODE_LISTENONLY;
+		dev_data->mcp2517_mode = MCP251XFD_CON_MODE_LISTENONLY;
 		break;
 	case CAN_LOOPBACK_MODE:
-		mcp2517_mode = MCP251XFD_CON_MODE_EXT_LOOPBACK;
+		dev_data->mcp2517_mode = MCP251XFD_CON_MODE_EXT_LOOPBACK;
 		break;
 	default:
 		LOG_ERR("Unsupported CAN Mode %u", mode);
@@ -786,7 +874,7 @@ static int mcp2517_set_mode(const struct device *dev, enum can_mode mode)
 		}
 	}
 
-	ret = mcp2517_set_mode_int(dev, mcp2517_mode);
+	ret = mcp2517_set_mode_int(dev, dev_data->mcp2517_mode);
 	if (ret < 0) {
 		LOG_ERR("Failed to set the mode [%d]", ret);
 
@@ -947,10 +1035,11 @@ static int mcp2517_get_max_bitrate(const struct device *dev, uint32_t *max_bitra
 static void mcp2517_rx(const struct device *dev)
 {
 	struct zcan_frame frame;
-
 	/* Fetch rx buffer */
-	mcp2517_read_rx_fifo(dev, &frame);
-	mcp2517_rx_filter(dev, &frame);
+	while (mcp2517_read_rx_fifo(dev, &frame) == 0) {
+		mcp2517_rx_filter(dev, &frame);
+	}
+
 }
 
 static void mcp2517_handle_errors(const struct device *dev)
@@ -987,28 +1076,50 @@ static void mcp2517_handle_interrupts(const struct device *dev)
 			LOG_ERR("Couldn't read INTF register %d", ret);
 			continue;
 		}
-		if ((canintf & 0xFFFF0000) == 0) {
+		if ((canintf & 0xFFFF) == 0) {
 			/* No interrupt flags set */
 			break;
 		}
 
+		if (!(canintf & MCP251XFD_INT_RXIF || canintf & MCP251XFD_INT_RXOVIF)) {
+			LOG_ERR("interrupt flags 0x%08x", canintf);
+			uint8_t mode = 0;
+			mcp2517_get_mode_int(dev, &mode);
+			LOG_ERR("mode 0x%02x", mode);
+		}
+
 		if (canintf & MCP251XFD_INT_RXIF || canintf & MCP251XFD_INT_RXOVIF) {
 			mcp2517_rx(dev);
+		}
 
-			/* RX0IF flag cleared automatically during read */
-			canintf &= ~MCP251XFD_INT_RXIF;
-			canintf &= ~MCP251XFD_INT_RXOVIF;
+		if (canintf & MCP251XFD_INT_RXOVIF) {
+			// reset RX fifo
+			uint32_t fifo_ctrl;
+			ret = mcp2517_cmd_read_words(dev, MCP251XFD_ADDR_FIFOCON(MCP251XFD_RX_FIFO_INDEX), &fifo_ctrl, 1);
+			if (ret != 0) {
+				LOG_ERR("Couldn't reset RX fifo %d", ret);
+				continue;
+			}
+			fifo_ctrl |= MCP251XFD_FIFOCON_FRESET;
+			ret = mcp2517_cmd_write_words(dev, MCP251XFD_ADDR_FIFOCON(MCP251XFD_RX_FIFO_INDEX), &fifo_ctrl, 1);
+			if (ret != 0) {
+				LOG_ERR("Couldn't reset RX fifo %d", ret);
+				continue;
+			}
 		}
 
 		if (canintf & MCP251XFD_INT_CERRIF) {
 			mcp2517_handle_errors(dev);
+			LOG_ERR("CAN bus error");
 		}
 
-		if ((canintf & 0xFFFF) != 0) {
-			canintf &= 0xFFFF0000;
-			/* Clear remaining flags */
-			mcp2517_cmd_write_words(dev, MCP251XFD_ADDR_INT, &canintf, 1);
+		if (canintf & MCP251XFD_INT_SERRIF) {
+			LOG_ERR("CAN System error");
 		}
+
+		canintf &= 0xFFFF0000;
+		/* Clear remaining flags */
+		mcp2517_cmd_write_words(dev, MCP251XFD_ADDR_INT, &canintf, 1);
 
 		/* Break from loop if INT pin is inactive */
 		ret = gpio_pin_get_dt(&dev_cfg->int_gpio);
@@ -1087,6 +1198,26 @@ static const struct can_driver_api can_api_funcs = {
 #endif
 };
 
+#ifdef NRF_TIMER1
+void gpio_clock_4m(uint32_t pin_number)
+{
+    
+    NRF_TIMER1->PRESCALER = 1; // 16MHz
+    NRF_TIMER1->SHORTS = TIMER_SHORTS_COMPARE0_CLEAR_Msk;
+    NRF_TIMER1->CC[0] = 1;
+
+    NRF_GPIOTE->CONFIG[0] = GPIOTE_CONFIG_MODE_Task | (pin_number << GPIOTE_CONFIG_PSEL_Pos) |
+                            (GPIOTE_CONFIG_POLARITY_Toggle << GPIOTE_CONFIG_POLARITY_Pos);
+
+    /*Connect TIMER event to GPIOTE out task*/
+    NRF_PPI->CH[0].EEP = (uint32_t) &NRF_TIMER1->EVENTS_COMPARE[0];
+    NRF_PPI->CH[0].TEP = (uint32_t) &NRF_GPIOTE->TASKS_OUT[0];
+    NRF_PPI->CHENSET   = 1;
+
+    /*Starts clock signal*/
+    NRF_TIMER1->TASKS_START = 1;
+}
+#endif
 
 static int mcp2517_init(const struct device *dev)
 {
@@ -1099,7 +1230,12 @@ static int mcp2517_init(const struct device *dev)
 		;
 	int ret;
 	int i;
-	uint32_t max_spi_freq;
+
+#ifdef NRF_TIMER1
+	if (dev_cfg->osc_pin_number != -1) {
+		gpio_clock_4m(dev_cfg->osc_pin_number);
+	}
+#endif
 
 	k_sem_init(&dev_data->int_sem, 0, 1);
 	k_mutex_init(&dev_data->mutex);
@@ -1117,36 +1253,30 @@ static int mcp2517_init(const struct device *dev)
 		}
 	}
 
-	if (!spi_is_ready(&dev_cfg->bus)) {
-		LOG_ERR("SPI bus %s not ready", dev_cfg->bus.bus->name);
-		return -ENODEV;
-	}
-
 	if (dev_cfg->pll_enable) {
 		if (dev_cfg->osc_freq > 4000000) {
 			LOG_ERR("Oscillator frequency too high for pll");
 			return -EINVAL;
 		}
 		dev_data->osc_freq = dev_cfg->osc_freq * 10; // 10x multiplier
+		LOG_INF("Oscillator frequency %d", dev_data->osc_freq);
 	} else {
 		dev_data->osc_freq = dev_cfg->osc_freq;
 	}
 
 	// record user defined spi frequency for later use
-	max_spi_freq = dev_cfg->bus.config.frequency;
-	if (max_spi_freq > (dev_data->osc_freq/2)) {
+	if (dev_cfg->bus.config.frequency > (dev_data->osc_freq/2)) {
 		LOG_WRN("SPI frequency too high, reducing to %d", dev_data->osc_freq/2);
-		max_spi_freq = dev_data->osc_freq/2;
+		return -EINVAL;
+	}
+
+	if (!spi_is_ready(&dev_cfg->bus)) {
+		LOG_ERR("SPI bus %s not ready", dev_cfg->bus.bus->name);
+		return -ENODEV;
 	}
 
 	// set spi to 1MHz for init
-	dev_cfg->bus.config.frequency = 1000000;
-
-	// wait for OSCRDY PLLRDY
-	if (mcp2517_wait_for_osc(dev, dev_cfg->pll_enable) < 0) {
-		LOG_ERR("failed to wait for Osc ready (err %d)", ret);
-		return -EIO;
-	}
+	LOG_INF("SPI frequency %lu", dev_cfg->bus.config.frequency);
 
 	/* Reset MCP2517 */
 	if (mcp2517_cmd_soft_reset(dev) < 0) {
@@ -1154,8 +1284,11 @@ static int mcp2517_init(const struct device *dev)
 		return -EIO;
 	}
 
-	// reset spi frequency to user defined value
-	dev_cfg->bus.config.frequency = max_spi_freq;
+	// wait for OSCRDY PLLRDY
+	if (mcp2517_wait_for_osc(dev, dev_cfg->pll_enable) < 0) {
+		LOG_ERR("failed to wait for Osc ready (err %d)", ret);
+		return -EIO;
+	}
 
 	// clear ram
 	uint32_t val = 0;
@@ -1173,7 +1306,7 @@ static int mcp2517_init(const struct device *dev)
 			return -EIO;
 		}
 		if (val != 0) {
-			LOG_ERR("RAM not cleared");
+			LOG_ERR("RAM not cleared Pos: %lx Val: %lx Freq: %llu", i, val, dev_cfg->bus.config.frequency);
 			return -EIO;
 		}
 	}
@@ -1335,6 +1468,7 @@ static const struct mcp251xfd_config mcp2517_config_1 = {
 	.phy = DEVICE_DT_GET_OR_NULL(DT_INST_PHANDLE(0, phys)),
 	.max_bitrate = DT_INST_CAN_TRANSCEIVER_MAX_BITRATE(0, 8000000),
 	.pll_enable = DT_INST_PROP_OR(0, pll_enable, false),
+	.osc_pin_number = DT_INST_PROP_OR(0, osc_pin_number, -1),
 };
 
 DEVICE_DT_INST_DEFINE(0, &mcp2517_init, NULL,

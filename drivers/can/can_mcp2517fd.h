@@ -18,7 +18,7 @@
 #define MCP2517FD_MAX_MSG_SIZE 76
 #define MCP2517FD_TXEVENT_FIFO_SIZE 0xC
 #define MCP2517FD_TX_FIFO_SIZE 0xC
-#define MCP2517FD_RX_FIFO_SIZE 0xD
+#define MCP2517FD_RX_FIFO_SIZE 0x1F
 #define MCP2517FD_NUM_SPI_RETRIES 10
 
 struct mcp251xfd_tx_cb {
@@ -54,6 +54,7 @@ struct mcp251xfd_data {
 	enum can_state old_state;
 	uint8_t sjw;
 	uint32_t osc_freq;
+	uint8_t mcp2517_mode;
 };
 
 struct mcp2517frame {
@@ -69,7 +70,7 @@ struct mcp2517frame {
 		uint32_t FILHIT0 : 7;
 		uint32_t unimplemented1 : 16;
 	} ctrl;
-	uint8_t data[64];
+	uint8_t data[8];
 } __packed;
 
 typedef enum {
@@ -107,6 +108,7 @@ struct mcp251xfd_config {
 	uint32_t osc_freq;
 	uint16_t sample_point;
 	bool pll_enable;
+	int8_t osc_pin_number;
 
 	/* CAN transceiver */
 	const struct device *phy;
