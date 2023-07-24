@@ -720,7 +720,7 @@ static int mcp2517_send(const struct device *dev,
 	// send to tx fifo
 	int32_t ret = mcp2517_write_tx_fifo(dev, frame);
 	if (ret < 0) {
-		LOG_ERR("Failed to write tx fifo");
+		LOG_ERR("Failed to write tx fifo %d", ret);
 		k_mutex_unlock(&dev_data->mutex);
 		k_sem_give(&dev_data->tx_sem);
 		return ret;
@@ -1051,12 +1051,12 @@ static void mcp2517_handle_errors(const struct device *dev)
 	struct can_bus_err_cnt err_cnt;
 	int err;
 
-	err = mcp2517_get_state(dev, &state, state_change_cb ? &err_cnt : NULL);
+	err = mcp2517_get_state(dev, &state, &err_cnt);
 	if (err != 0) {
 		LOG_ERR("Failed to get CAN controller state [%d]", err);
 		return;
 	}
-
+	LOG_ERR("CAN bus error state %d TXERR(%u) RXERR(%u)", state, err_cnt.tx_err_cnt, err_cnt.rx_err_cnt);
 	if (state_change_cb && dev_data->old_state != state) {
 		dev_data->old_state = state;
 		state_change_cb(dev, state, err_cnt, state_change_cb_data);
@@ -1370,9 +1370,9 @@ static int mcp2517_init(const struct device *dev)
 			LOG_ERR("Can't find timing for given param");
 			return -EIO;
 		}
-		LOG_DBG("Presc: %d, BS1: %d, BS2: %d",
+		LOG_INF("Presc: %d, BS1: %d, BS2: %d",
 			timing.prescaler, timing.phase_seg1, timing.phase_seg2);
-		LOG_DBG("Sample-point err : %d", ret);
+		LOG_INF("Sample-point err : %d", ret);
 	} else {
 		timing.prop_seg = dev_cfg->tq_prop;
 		timing.phase_seg1 = dev_cfg->tq_bs1;
@@ -1381,6 +1381,8 @@ static int mcp2517_init(const struct device *dev)
 		if (ret) {
 			LOG_WRN("Bitrate error: %d", ret);
 		}
+		LOG_INF("Presc: %d, BS1: %d, BS2: %d",
+			timing.prescaler, timing.phase_seg1 + timing.prop_seg, timing.phase_seg2);
 	}
 
 	// timing data
