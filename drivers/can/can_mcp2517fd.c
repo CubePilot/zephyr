@@ -11,6 +11,7 @@
 #include <drivers/can/transceiver.h>
 #include <drivers/spi.h>
 #include <drivers/gpio.h>
+#include <drivers/pwm.h>
 #include <logging/log.h>
 #include <logging/log_ctrl.h>
 #include <sys/byteorder.h>
@@ -324,7 +325,8 @@ static int mcp2517_set_mode_int(const struct device *dev, uint8_t mode)
 	}
 	LOG_INF("Waiting for mode change");
 	// wait for mode change
-	while (1)
+	uint8_t retries = MCP2517FD_NUM_SPI_RETRIES;
+	while (retries--)
 	{
 		if (mcp2517_get_mode_int(dev, &curr_mode) < 0) {
 			LOG_ERR("Failed to get mode");
@@ -335,7 +337,11 @@ static int mcp2517_set_mode_int(const struct device *dev, uint8_t mode)
 		}
 		k_msleep(3);
 	}
-	
+	if (retries == 0) {
+		LOG_ERR("Failed to change mode");
+		return -EIO;
+	}
+	return 0;	
 }
 
 static int mcp2517_enable_ecc(const struct device *dev)
@@ -464,7 +470,10 @@ static int32_t mcp2517_write_tx_fifo(const struct device *dev,
 	const struct mcp251xfd_data* dev_data = dev->data;
 	if (mode != dev_data->mcp2517_mode) {
 		LOG_ERR("Bad State: mode=%d", mode);
-		mcp2517_set_mode_int(dev, dev_data->mcp2517_mode);
+		ret = mcp2517_set_mode_int(dev, dev_data->mcp2517_mode);
+		if (ret != 0) {
+			return ret;
+		}
 	}
 	if (!(fifo_status & MCP251XFD_FIFOSTA_TFNRFNIF)) {
 		return -EBUSY;
@@ -1137,7 +1146,7 @@ static void mcp2517_int_thread(const struct device *dev)
 	struct mcp251xfd_data *dev_data = dev->data;
 
 	while (1) {
-		k_sem_take(&dev_data->int_sem, K_FOREVER);
+		k_sem_take(&dev_data->int_sem, K_MSEC(1000));
 		mcp2517_handle_interrupts(dev);
 	}
 }
@@ -1199,23 +1208,11 @@ static const struct can_driver_api can_api_funcs = {
 };
 
 #ifdef NRF_TIMER1
-void gpio_clock_4m(uint32_t pin_number)
+#include <zephyr/drivers/pwm.h>
+// const struct pwm_dt_spec clkgen = PWM_DT_SPEC_GET(DT_ALIAS(clkgen_pwm));
+void gpio_clock_4m(const struct device *clkgen)
 {
-    
-    NRF_TIMER1->PRESCALER = 1; // 16MHz
-    NRF_TIMER1->SHORTS = TIMER_SHORTS_COMPARE0_CLEAR_Msk;
-    NRF_TIMER1->CC[0] = 1;
-
-    NRF_GPIOTE->CONFIG[0] = GPIOTE_CONFIG_MODE_Task | (pin_number << GPIOTE_CONFIG_PSEL_Pos) |
-                            (GPIOTE_CONFIG_POLARITY_Toggle << GPIOTE_CONFIG_POLARITY_Pos);
-
-    /*Connect TIMER event to GPIOTE out task*/
-    NRF_PPI->CH[0].EEP = (uint32_t) &NRF_TIMER1->EVENTS_COMPARE[0];
-    NRF_PPI->CH[0].TEP = (uint32_t) &NRF_GPIOTE->TASKS_OUT[0];
-    NRF_PPI->CHENSET   = 1;
-
-    /*Starts clock signal*/
-    NRF_TIMER1->TASKS_START = 1;
+	pwm_set(clkgen, 0, PWM_HZ(4000000), PWM_HZ(4000000) / 2, 0);
 }
 #endif
 
@@ -1232,8 +1229,8 @@ static int mcp2517_init(const struct device *dev)
 	int i;
 
 #ifdef NRF_TIMER1
-	if (dev_cfg->osc_pin_number != -1) {
-		gpio_clock_4m(dev_cfg->osc_pin_number);
+	if (dev_cfg->clock != NULL) {
+		gpio_clock_4m(dev_cfg->clock);
 	}
 #endif
 
@@ -1470,7 +1467,7 @@ static const struct mcp251xfd_config mcp2517_config_1 = {
 	.phy = DEVICE_DT_GET_OR_NULL(DT_INST_PHANDLE(0, phys)),
 	.max_bitrate = DT_INST_CAN_TRANSCEIVER_MAX_BITRATE(0, 8000000),
 	.pll_enable = DT_INST_PROP_OR(0, pll_enable, false),
-	.osc_pin_number = DT_INST_PROP_OR(0, osc_pin_number, -1),
+	.clock = DEVICE_DT_GET_OR_NULL(DT_INST_PHANDLE(0, clock)),
 };
 
 DEVICE_DT_INST_DEFINE(0, &mcp2517_init, NULL,

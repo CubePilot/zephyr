@@ -32,10 +32,10 @@ properties:
     reg:
       type: array
       required: true
-    osc-pin-number:
-      type: int
+    clock:
+      type: phandle
       required: false
       description: |
-        Oscillator pin number.
+        PWM Clock.
 
-        The oscillator pin number is used put out 4MHz on the oscillator pin.
+        This clock is used to generate the clock using PWM peripheral.

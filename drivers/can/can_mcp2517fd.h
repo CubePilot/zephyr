@@ -108,7 +108,7 @@ struct mcp251xfd_config {
 	uint32_t osc_freq;
 	uint16_t sample_point;
 	bool pll_enable;
-	int8_t osc_pin_number;
+	const struct device *clock;
 
 	/* CAN transceiver */
 	const struct device *phy;
